@@ -1,0 +1,221 @@
+//  ESP RainMaker - for Children room Geyer , device name GardenLights - Nov 2022
+// Relay connected in NC
+
+#include "RMaker.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <ArduinoOTA.h>
+
+#define THRESHOLD 50
+
+
+const char *OTAName = "GardenLight01" ; // name of OTA service, change it
+
+#define DEFAULT_POWER_MODE false
+
+const char *service_name = "PROV_1969";
+const char *pop = "dec1112";
+
+ 
+//GPIO for virtual device
+static int gpio_0 = 0;
+static int gpio_relay = 4 ; // use the correct GPIO where the relay is attached, make it 4 later
+
+const char *powerS="Power";
+
+bool relay_state = false;  // intial state of relay
+
+static Switch my_switch;
+
+// touch sensor related variables
+// Touch sensor at GPIO 13 /T4
+
+portMUX_TYPE touchMux = portMUX_INITIALIZER_UNLOCKED; // for touchdetected 
+
+
+volatile bool touchdetected = false;
+unsigned long firsttouch=0, nexttouch=0;
+
+
+void IRAM_ATTR gotTouch(){
+ 
+ nexttouch=millis();
+ if ( nexttouch - firsttouch > 1000 ){
+    portENTER_CRITICAL_ISR(&touchMux);
+    touchdetected = true;
+    portEXIT_CRITICAL_ISR(&touchMux);
+  
+ }
+  
+ firsttouch=nexttouch; 
+ 
+}
+
+void sysProvEvent(arduino_event_t *sys_event)
+{
+    switch (sys_event->event_id) {      
+        case ARDUINO_EVENT_PROV_START:
+
+        Serial.printf("\nProvisioning Started with name \"%s\" and PoP \"%s\" on BLE\n", service_name, pop);
+        printQR(service_name, pop, "ble");
+        break;
+        default:;
+    }
+}
+
+
+// call back function gets called whenever we modify state in app
+
+void write_callback(Device *device, Param *param, const param_val_t val, void *priv_data, write_ctx_t *ctx)
+{
+    const char *device_name = device->getDeviceName();
+    const char *param_name = param->getParamName();
+   
+     if(strcmp(param_name, "Power") == 0) {
+        Serial.printf("Received value = %s for %s - %s\n", val.val.b? "true" : "false", device_name, param_name);
+        relay_state = val.val.b;
+        (relay_state == false) ? digitalWrite(gpio_relay, HIGH) : digitalWrite(gpio_relay, LOW);
+     }
+
+        param->updateAndReport(val);
+              
+}
+
+
+
+void setup()
+{
+    Serial.begin(115200);
+    pinMode(gpio_0, INPUT);
+    pinMode(gpio_relay, OUTPUT);
+    digitalWrite(gpio_relay, HIGH); // off
+    
+    
+    touchAttachInterrupt(T4, gotTouch, THRESHOLD); //GPIO 13
+
+
+    Node my_node;    
+    my_node = RMaker.initNode("ESP RainMaker Garden1");
+
+    //Initialize switch device
+    my_switch = Switch("GardenLights", &gpio_relay);
+
+    //Standard switch device
+    my_switch.addCb(write_callback);
+
+    //Add switch device to the node
+    my_node.addDevice(my_switch);
+
+     //If you want to enable scheduling, set time zone for your region using setTimeZone(). 
+    //The list of available values are provided here https://rainmaker.espressif.com/docs/time-service.html
+
+    
+     
+    // Alternatively, enable the Timezone service and let the phone apps set the appropriate timezone
+    RMaker.enableTZService();
+
+    RMaker.enableSchedule();
+
+    RMaker.start();
+
+    WiFi.onEvent(sysProvEvent);
+
+    // provision over BLE
+
+    WiFiProv.beginProvision(WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BTDM, WIFI_PROV_SECURITY_1, pop, service_name);
+
+    my_switch.updateAndReportParam(powerS, false); // initial state
+
+
+
+// Classic OTA
+
+ArduinoOTA.setHostname(OTAName);  
+
+// OTA code added
+ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+       
+}
+
+
+void loop()
+{
+    ArduinoOTA.handle();
+    
+
+    // check if touch was detected
+
+    
+   if(touchdetected) { // touch switch
+      portENTER_CRITICAL_ISR(&touchMux);       
+      touchdetected = false;      
+      portEXIT_CRITICAL_ISR(&touchMux);   
+      
+      Serial.println("Touch T4: detected");
+      my_switch.updateAndReportParam(powerS, !relay_state);
+      
+       if ( relay_state)          
+          digitalWrite(gpio_relay, HIGH); // switch is off  
+       else  
+          digitalWrite(gpio_relay, LOW); 
+
+        relay_state=!relay_state;
+       
+   } // end touch detected
+
+        // mainly for resetting using gpio_o , normally not used
+        
+    if(digitalRead(gpio_0) == LOW) { //Push button pressed
+
+        // Key debounce handling
+        delay(100);
+        int startTime = millis();
+        while(digitalRead(gpio_0) == LOW) delay(50);
+        int endTime = millis();
+
+        if ((endTime - startTime) > 10000) {  
+          // If key pressed for more than 10secs, reset all
+          Serial.printf("Reset to factory.\n");
+          RMakerFactoryReset(2);
+        } else if ((endTime - startTime) > 3000) {
+          Serial.printf("Reset Wi-Fi.\n");
+          // If key pressed for more than 3secs, but less than 10, reset Wi-Fi
+          RMakerWiFiReset(2);
+        } else {
+          // Toggle device state
+          relay_state = !relay_state;
+          Serial.printf("Toggle State to %s.\n", relay_state ? "true" : "false");
+          my_switch.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, relay_state);
+          (relay_state == false) ? digitalWrite(gpio_relay, LOW) : digitalWrite(gpio_relay, HIGH);
+      }
+    }
+  
+    
+    delay(100);
+}
